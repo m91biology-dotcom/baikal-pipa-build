@@ -1,0 +1,254 @@
+name: Build BaikalOS for Xiaomi Pad 6 (pipa)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build Variant'
+        required: true
+        default: 'userdebug'
+        type: choice
+        options:
+          - userdebug
+          - user
+          - eng
+      shallow_sync:
+        description: 'Use Shallow Sync (--depth=1 to save disk space)'
+        required: true
+        default: true
+        type: boolean
+      sync_threads:
+        description: 'Parallel Sync Threads'
+        required: true
+        default: '8'
+
+jobs:
+  build-rom:
+    name: Compile BaikalOS for pipa
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Checkout Workflow Repo
+        uses: actions/checkout@v4
+
+      - name: 2. Maximize Disk Space
+        run: |
+          echo "=== Freeing disk space on runner ==="
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune -a -f || true
+          sudo apt-get autoremove -y || true
+          sudo apt-get clean || true
+          echo "=== Disk space after cleanup ==="
+          df -h
+
+      - name: 3. Set Up Swap Memory
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=12288
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: 4. Install Build Prerequisites & OpenJDK
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git git-lfs gnupg gperf imagemagick lib32readline-dev lib32z1-dev \
+            liblz4-tool libssl-dev libxml2 libxml2-utils lzop pngcrush rsync \
+            schedtool squashfs-tools xsltproc zip zlib1g-dev unzip tar procps \
+            python3 python-is-python3 python3-pip openjdk-11-jdk libncurses5 \
+            libncurses5-dev lib32ncurses5-dev ca-certificates
+
+      - name: 5. Configure Git & Install Repo Tool
+        run: |
+          git config --global user.name "BaikalOS Builder"
+          git config --global user.email "builder@github.actions"
+          git config --global http.postBuffer 524288000
+          git lfs install
+
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: 6. Initialize BaikalOS Source (repo init)
+        run: |
+          mkdir -p ~/BaikalOS
+          cd ~/BaikalOS
+          if [ "${{ inputs.shallow_sync }}" = "true" ]; then
+            repo init -u https://github.com/baikalos/android.git -b 13.0 --git-lfs --depth=1 --no-clone-bundle
+          else
+            repo init -u https://github.com/baikalos/android.git -b 13.0 --git-lfs --no-clone-bundle
+          fi
+
+      - name: 7. Inject pipa.xml Local Manifest
+        run: |
+          cd ~/BaikalOS
+          mkdir -p .repo/local_manifests
+          cat << 'EOF' > .repo/local_manifests/pipa.xml
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+              <project path="device/xiaomi/pipa"
+                       name="crdroidandroid/android_device_xiaomi_pipa"
+                       remote="github"
+                       revision="16.0" />
+
+              <project path="device/xiaomi/sm8250-common"
+                       name="crdroidandroid/android_device_xiaomi_sm8250-common"
+                       remote="github"
+                       revision="16.0-pipa" />
+
+              <project path="kernel/xiaomi/sm8250"
+                       name="crdroidandroid/android_kernel_xiaomi_sm8250"
+                       remote="github"
+                       revision="16.0-pipa" />
+
+              <project path="vendor/xiaomi/pipa"
+                       name="TheMuppets/proprietary_vendor_xiaomi_pipa"
+                       remote="github"
+                       revision="lineage-23.2" />
+
+              <project path="vendor/xiaomi/sm8250-common"
+                       name="TheMuppets/proprietary_vendor_xiaomi_sm8250-common"
+                       remote="github"
+                       revision="lineage-23.2" />
+
+              <project path="hardware/xiaomi"
+                       name="crdroidandroid/android_hardware_xiaomi"
+                       remote="github"
+                       revision="16.0" />
+          </manifest>
+          EOF
+          cat .repo/local_manifests/pipa.xml
+
+      - name: 8. Sync Repositories (repo sync)
+        run: |
+          cd ~/BaikalOS
+          repo sync -c -j${{ inputs.sync_threads }} --force-sync --no-clone-bundle --no-tags
+
+      - name: 9. Apply BaikalOS Adaptations & Conflict Resolutions
+        run: |
+          cd ~/BaikalOS/device/xiaomi/pipa
+
+          # Create baikal_pipa.mk
+          cat << 'EOF' > baikal_pipa.mk
+          # Inherit core products
+          $(call inherit-product, $(SRC_TARGET_DIR)/product/core_64_bit.mk)
+          $(call inherit-product, $(SRC_TARGET_DIR)/product/full_base.mk)
+
+          # Inherit BaikalOS / Lineage common configurations
+          $(call inherit-product-if-exists, vendor/baikalos/config/common_full_tablet_wifionly.mk)
+          $(call inherit-product-if-exists, vendor/baikalos/config/common.mk)
+          $(call inherit-product-if-exists, vendor/lineage/config/common_full_tablet_wifionly.mk)
+
+          # Inherit from pipa device
+          $(call inherit-product, device/xiaomi/pipa/device.mk)
+
+          PRODUCT_NAME := baikal_pipa
+          PRODUCT_DEVICE := pipa
+          PRODUCT_MANUFACTURER := Xiaomi
+          PRODUCT_BRAND := Xiaomi
+          PRODUCT_MODEL := 23043RP34G
+          PRODUCT_CHARACTERISTICS := tablet
+          TARGET_SUPPORTS_QUICK_TAP := false
+          PRODUCT_GMS_CLIENTID_BASE := android-xiaomi
+          EOF
+
+          # Update AndroidProducts.mk
+          cat << 'EOF' > AndroidProducts.mk
+          PRODUCT_MAKEFILES := \
+              $(LOCAL_DIR)/baikal_pipa.mk \
+              $(LOCAL_DIR)/lineage_pipa.mk
+
+          COMMON_LUNCH_CHOICES := \
+              baikal_pipa-userdebug \
+              baikal_pipa-user \
+              baikal_pipa-eng
+          EOF
+
+          # Safety patch for sepolicy includes
+          cd ~/BaikalOS/device/xiaomi/sm8250-common
+          sed -i 's/^include device\/lineage\/sepolicy\/libperfmgr\/sepolicy.mk/-include device\/lineage\/sepolicy\/libperfmgr\/sepolicy.mk/' BoardConfigCommon.mk 2>/dev/null || true
+          sed -i 's/^include device\/qcom\/sepolicy_vndr\/SEPolicy.mk/-include device\/qcom\/sepolicy_vndr\/SEPolicy.mk/' BoardConfigCommon.mk 2>/dev/null || true
+
+      - name: 10. Configure Ccache
+        run: |
+          export USE_CCACHE=1
+          export CCACHE_EXEC=/usr/bin/ccache
+          ccache -M 30G
+          ccache -z
+
+      - name: 11. Compile BaikalOS ROM
+        id: compile
+        run: |
+          cd ~/BaikalOS
+          source build/envsetup.sh
+          lunch baikal_pipa-${{ inputs.build_type }} || lunch lineage_pipa-${{ inputs.build_type }}
+
+          CPU_CORES=$(nproc --all)
+          echo "Starting build with $CPU_CORES parallel jobs..."
+          m bacon -j"$CPU_CORES" 2>&1 | tee build.log
+
+      - name: 12. Locate Flashable ROM Output
+        id: locate_rom
+        if: always()
+        run: |
+          cd ~/BaikalOS
+          ZIP_FILE=$(find out/target/product/pipa -maxdepth 1 -name "baikal_*.zip" -o -name "lineage_*.zip" 2>/dev/null | head -n 1 || true)
+          if [ -n "$ZIP_FILE" ] && [ -f "$ZIP_FILE" ]; then
+            echo "rom_found=true" >> $GITHUB_OUTPUT
+            echo "rom_path=$ZIP_FILE" >> $GITHUB_OUTPUT
+            echo "rom_name=$(basename "$ZIP_FILE")" >> $GITHUB_OUTPUT
+            echo "=== ROM Output Found: $(basename "$ZIP_FILE") ==="
+            ls -lh "$ZIP_FILE"
+            md5sum "$ZIP_FILE" > "$ZIP_FILE.md5sum"
+          else
+            echo "rom_found=false" >> $GITHUB_OUTPUT
+            echo "=== No ROM ZIP generated ==="
+          fi
+
+      - name: 13. Upload ROM to GitHub Release
+        if: steps.locate_rom.outputs.rom_found == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "BaikalOS-pipa-${{ github.run_number }}"
+          name: "BaikalOS for Xiaomi Pad 6 (pipa) - Build #${{ github.run_number }}"
+          body: |
+            ## BaikalOS Official Flashable Build for Xiaomi Pad 6 (pipa)
+            - **Device:** Xiaomi Pad 6 (`pipa`)
+            - **Variant:** `${{ inputs.build_type }}`
+            - **Build Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+            - **File:** `${{ steps.locate_rom.outputs.rom_name }}`
+          files: |
+            ~/BaikalOS/${{ steps.locate_rom.outputs.rom_path }}
+            ~/BaikalOS/${{ steps.locate_rom.outputs.rom_path }}.md5sum
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 14. Upload ROM to BashUpload / Transfer.sh (Direct Link Fallback)
+        if: steps.locate_rom.outputs.rom_found == 'true'
+        run: |
+          cd ~/BaikalOS
+          ROM_PATH="${{ steps.locate_rom.outputs.rom_path }}"
+          echo "=== Generating Direct Download Link ==="
+          curl -s --upload-file "$ROM_PATH" "https://bashupload.com/$(basename "$ROM_PATH")" || true
+
+      - name: 15. Upload Build Log (On Failure or Success)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: baikal-pipa-build-log
+          path: |
+            ~/BaikalOS/build.log
+            ~/BaikalOS/out/error.log
+          retention-days: 7
